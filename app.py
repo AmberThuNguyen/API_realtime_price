@@ -2,7 +2,6 @@
 import logging
 import traceback
 from flask import Flask, request, jsonify
-from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vnstock-api")
@@ -14,32 +13,41 @@ def normalize_symbol(sym: str) -> str:
         return ""
     return sym.strip().upper()
 
-def row_get_price_time(row_dict):
-    """Try many field names to extract price and time from a row dict."""
-    if row_dict is None:
-        return None, None
+def to_float_safe(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        try:
+            s = str(v).replace(",", "").strip()
+            return float(s)
+        except Exception:
+            return None
 
-    # normalize keys to lowercase for robust lookup
+def extract_from_row_dict(row_dict):
+    """
+    Given a dict (row), try to extract price(last), time, open, close.
+    Keys are checked case-insensitively and with many possible names.
+    Returns tuple: (price, time, open_price, close_price)
+    """
+    if not row_dict:
+        return None, None, None, None
+
     lower = {k.lower(): v for k, v in row_dict.items()}
 
-    # price candidates in order of preference
+    # price candidates (prefer last/match/close)
     price_keys = [
         "lastprice", "pricelast", "matchprice", "match_price",
-        "last", "close", "price", "closeprice", "close_price", "c", "match"
+        "last", "close", "price", "closeprice", "close_price",
+        "c", "match"
     ]
     price = None
     for k in price_keys:
         if k in lower and lower[k] is not None:
-            try:
-                price = float(lower[k])
+            price = to_float_safe(lower[k])
+            if price is not None:
                 break
-            except Exception:
-                try:
-                    # sometimes value is string with comma
-                    price = float(str(lower[k]).replace(",", ""))
-                    break
-                except Exception:
-                    price = None
 
     # time candidates
     time_keys = [
@@ -50,96 +58,144 @@ def row_get_price_time(row_dict):
         if k in lower and lower[k] is not None:
             tval = lower[k]
             break
+    tstr = str(tval) if tval is not None else None
 
-    # normalize time to iso string if possible
-    if tval is not None:
-        try:
-            # if it's pandas Timestamp-like, convert to string
-            tstr = str(tval)
-        except Exception:
-            tstr = None
-    else:
-        tstr = None
+    # open candidates
+    open_keys = ["open", "openprice", "priceopen", "o", "open_price"]
+    open_price = None
+    for k in open_keys:
+        if k in lower and lower[k] is not None:
+            open_price = to_float_safe(lower[k])
+            if open_price is not None:
+                break
 
-    return price, tstr
+    # close candidates (some sources keep close separate)
+    close_keys = ["close", "closeprice", "pricelast", "lastprice", "c", "matchprice", "priceclose", "close_price"]
+    close_price = None
+    for k in close_keys:
+        if k in lower and lower[k] is not None:
+            close_price = to_float_safe(lower[k])
+            if close_price is not None:
+                break
+
+    return price, tstr, open_price, close_price
 
 def get_price_from_df(df):
-    """Return (price, time) or (None, None). df may be pandas DataFrame-like."""
+    """
+    Given a DataFrame-like object (pandas), return price, time, open, close, or (None,...).
+    Uses last row for price/time; uses first row for open if available.
+    """
     try:
         if df is None:
-            return None, None
-        # pandas DataFrame has .empty
-        empty = False
-        try:
-            empty = getattr(df, "empty", False)
-        except Exception:
-            empty = False
-        if empty:
-            return None, None
+            return None, None, None, None
 
-        # get last row
+        # check empty
+        try:
+            if getattr(df, "empty", False):
+                return None, None, None, None
+        except Exception:
+            pass
+
+        # try last row
         try:
             last = df.tail(1).iloc[0]
         except Exception:
-            # maybe df is list-like dicts
             try:
                 last = df[-1]
             except Exception:
-                return None, None
+                last = None
 
-        # convert to dict
-        try:
-            rd = last.to_dict()
-        except Exception:
+        rd_last = None
+        if last is not None:
             try:
-                rd = dict(last)
+                rd_last = last.to_dict()
             except Exception:
-                return None, None
+                try:
+                    rd_last = dict(last)
+                except Exception:
+                    rd_last = None
 
-        price, time = row_get_price_time(rd)
-        return price, time
+        price, time_, open_p, close_p = extract_from_row_dict(rd_last) if rd_last else (None, None, None, None)
+
+        # if open or close missing, try head/tail combos
+        if (open_p is None) or (close_p is None):
+            try:
+                first = df.head(1).iloc[0]
+                try:
+                    rd_first = first.to_dict()
+                except Exception:
+                    rd_first = dict(first)
+            except Exception:
+                rd_first = None
+
+            # if open missing, try first row open or price
+            if open_p is None and rd_first:
+                _, _, open_from_first, _ = extract_from_row_dict(rd_first)
+                if open_from_first is not None:
+                    open_p = open_from_first
+                else:
+                    # try price field in first row (first trade)
+                    p_first, _, _, _ = extract_from_row_dict(rd_first)
+                    if p_first is not None:
+                        open_p = p_first
+
+            # if close missing, try last row close or price
+            if close_p is None and rd_last:
+                _, _, _, close_from_last = extract_from_row_dict(rd_last)
+                if close_from_last is not None:
+                    close_p = close_from_last
+                else:
+                    # last price fallback
+                    if price is not None:
+                        close_p = price
+
+        # final normalization (floats)
+        price = to_float_safe(price)
+        open_p = to_float_safe(open_p)
+        close_p = to_float_safe(close_p)
+
+        return price, time_, open_p, close_p
     except Exception as e:
-        log.exception("get_price_from_df failed: %s", e)
-        return None, None
+        log.exception("get_price_from_df exception: %s", e)
+        return None, None, None, None
 
 def try_legacy(symbol):
-    """Try old-style functions exposed at top-level of vnstock package."""
+    """Try old-style top-level vnstock functions."""
     try:
         import vnstock as vn
     except Exception as e:
         log.info("legacy import vnstock failed: %s", e)
         return None, {"error": f"legacy import failed: {e}"}
 
-    # Try stock_intraday_data if available
     try:
+        # intraday
         if hasattr(vn, "stock_intraday_data"):
-            log.info("Using legacy stock_intraday_data for %s", symbol)
             try:
                 df = vn.stock_intraday_data(symbol=symbol, page_num=0, page_size=5000)
             except TypeError:
-                # some versions have slightly different signature
                 df = vn.stock_intraday_data(symbol, 0, 5000)
-            price, time = get_price_from_df(df)
-            if price is not None:
-                return {"provider": "vnstock-legacy-intraday", "price": price, "time": time}, None
+            price, time_, open_p, close_p = get_price_from_df(df)
+            if price is not None or open_p is not None or close_p is not None:
+                return {"provider": "vnstock-legacy-intraday", "price": price, "time": time_, "open": open_p, "close": close_p}, None
 
         # fallback to historical
         if hasattr(vn, "stock_historical_data"):
-            log.info("Legacy intraday empty, trying stock_historical_data for %s", symbol)
-            df2 = vn.stock_historical_data(symbol=symbol, start_date="2020-01-01", end_date="2030-12-31", interval="1D")
-            price, time = get_price_from_df(df2)
-            if price is not None:
-                return {"provider": "vnstock-legacy-history", "price": price, "time": time}, None
+            try:
+                df2 = vn.stock_historical_data(symbol=symbol, start_date="2020-01-01", end_date="2030-12-31", interval="1D")
+            except TypeError:
+                df2 = vn.stock_historical_data(symbol, "2020-01-01", "2030-12-31")
+            price, time_, open_p, close_p = get_price_from_df(df2)
+            if price is not None or open_p is not None or close_p is not None:
+                return {"provider": "vnstock-legacy-history", "price": price, "time": time_, "open": open_p, "close": close_p}, None
 
-        return None, {"info": "legacy functions present but returned no data"}
+        return None, {"info": "legacy present but returned no data"}
     except Exception as e:
         log.exception("legacy usage error: %s", e)
         return None, {"error": f"legacy usage exception: {e}"}
 
 def try_v3(symbol):
-    """Try vnstock v3 style usage (Vnstock / Quote)."""
+    """Try vnstock v3 style (Vnstock class)."""
     try:
-        # import Vnstock class
         from vnstock import Vnstock
     except Exception as e:
         log.info("vnstock Vnstock import failed: %s", e)
@@ -147,26 +203,21 @@ def try_v3(symbol):
 
     try:
         v = Vnstock()
-        # create stock object; try with default behavior first
         stock_obj = None
         try:
             stock_obj = v.stock(symbol=symbol)
-        except Exception as e:
-            log.info("Vnstock.stock default failed, trying without source: %s", e)
-            # try without named parameter
+        except Exception:
             try:
                 stock_obj = v.stock(symbol)
-            except Exception as ee:
-                log.info("Vnstock.stock fallback failed: %s", ee)
+            except Exception:
                 stock_obj = None
 
         if stock_obj is None:
-            # try alternate known sources (vcb/vci/TCBS) by name if supported
             for src in ("VCI", "TCBS", "SSI"):
                 try:
                     stock_obj = v.stock(symbol=symbol, source=src)
                     if stock_obj:
-                        log.info("Vnstock.stock: found using source %s", src)
+                        log.info("Vnstock.stock using source %s", src)
                         break
                 except Exception:
                     stock_obj = None
@@ -174,7 +225,7 @@ def try_v3(symbol):
         if stock_obj is None:
             return None, {"info": "v3 stock object creation failed"}
 
-        # try intraday via stock.quote.intraday
+        # intraday
         df = None
         try:
             if hasattr(stock_obj, "quote") and hasattr(stock_obj.quote, "intraday"):
@@ -192,12 +243,11 @@ def try_v3(symbol):
                 log.info("v3 history failed: %s", e)
                 df = None
 
-        price, time = get_price_from_df(df)
-        if price is not None:
-            return {"provider": "vnstock-v3", "price": price, "time": time}, None
+        price, time_, open_p, close_p = get_price_from_df(df)
+        if price is not None or open_p is not None or close_p is not None:
+            return {"provider": "vnstock-v3", "price": price, "time": time_, "open": open_p, "close": close_p}, None
 
         return None, {"info": "v3 returned no data"}
-
     except Exception as e:
         log.exception("vnstock v3 usage exception: %s", e)
         return None, {"error": f"v3 exception: {e}"}
@@ -209,17 +259,16 @@ def price():
     fallback_to_close = request.args.get("fallback", "close")  # 'close' or 'none'
 
     if not sym:
-        # default example: VNM (keeps backward compatibility)
         sym = "VNM"
 
-    result = {"symbol": sym, "price": None, "time": None, "provider": None}
+    result = {"symbol": sym, "price": None, "time": None, "open": None, "close": None, "provider": None}
     details = {}
 
-    # 1) Try legacy top-level API
+    # 1) try legacy
     try:
         r, info = try_legacy(sym)
         if r:
-            result.update({"price": r["price"], "time": r["time"], "provider": r.get("provider")})
+            result.update({"price": r.get("price"), "time": r.get("time"), "open": r.get("open"), "close": r.get("close"), "provider": r.get("provider")})
             details["legacy"] = "ok"
             if debug:
                 details["legacy_detail"] = r
@@ -228,12 +277,12 @@ def price():
     except Exception as e:
         details["legacy_exception"] = str(e) + "\n" + traceback.format_exc()
 
-    # 2) If still no data, try v3
-    if result["price"] is None:
+    # 2) try v3
+    if result["price"] is None and result["open"] is None and result["close"] is None:
         try:
             r2, info2 = try_v3(sym)
             if r2:
-                result.update({"price": r2["price"], "time": r2["time"], "provider": r2.get("provider")})
+                result.update({"price": r2.get("price"), "time": r2.get("time"), "open": r2.get("open"), "close": r2.get("close"), "provider": r2.get("provider")})
                 details["v3"] = "ok"
                 if debug:
                     details["v3_detail"] = r2
@@ -242,10 +291,9 @@ def price():
         except Exception as e:
             details["v3_exception"] = str(e) + "\n" + traceback.format_exc()
 
-    # 3) If still none and fallback==close, try explicitly historical close (aggressive)
-    if result["price"] is None and fallback_to_close == "close":
+    # 3) fallback: aggressively try historical close/open
+    if (result["price"] is None and result["open"] is None and result["close"] is None) and fallback_to_close == "close":
         try:
-            # try to explicitly call historical data via any available API
             import vnstock as vnmod
             df = None
             if hasattr(vnmod, "stock_historical_data"):
@@ -256,7 +304,6 @@ def price():
                         df = vnmod.stock_historical_data(sym, "2020-01-01", "2030-12-31")
                     except Exception:
                         df = None
-            # or try v3 history if available
             if (df is None or getattr(df, "empty", True)) and 'Vnstock' in globals():
                 try:
                     from vnstock import Vnstock
@@ -267,15 +314,21 @@ def price():
                 except Exception:
                     pass
 
-            price, time = get_price_from_df(df)
-            if price is not None:
-                result.update({"price": price, "time": time, "provider": "historical-fallback"})
+            price, time_, open_p, close_p = get_price_from_df(df)
+            if price is not None or open_p is not None or close_p is not None:
+                result.update({"price": price, "time": time_, "open": open_p, "close": close_p, "provider": "historical-fallback"})
                 details["historical_fallback"] = "ok"
         except Exception as e:
             details["historical_exception"] = str(e)
 
-    # 4) return
-    out = {"symbol": result["symbol"], "price": result["price"], "time": result["time"], "provider": result["provider"] or None}
+    out = {
+        "symbol": result["symbol"],
+        "price": result["price"],
+        "time": result["time"],
+        "open": result["open"],
+        "close": result["close"],
+        "provider": result["provider"] or None
+    }
     if debug:
         out["_debug"] = details
     return jsonify(out)
