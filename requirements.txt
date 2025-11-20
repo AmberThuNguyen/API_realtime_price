@@ -1,2 +1,6 @@
 flask
 vnstock
+fastapi
+uvicorn
+vnstock
+pandas
